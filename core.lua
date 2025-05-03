@@ -113,7 +113,7 @@ end)
 _G.SLASH_FUBACANCELCINEMATIC1 = '/fcc'
 SlashCmdList.FUBACANCELCINEMATIC = function(msg)
   if not msg or type(msg) ~= "string" or msg == "" or msg == "help" then
-    print("|cff0080ff\nfuba's Cancel Cinematic Usage:\n|r============================================================\n|cff0080ff/fcc|r or |cff0080ff/fcc help|r - Show this message\n|cff0080ff/fcc all|r - Toggle \"Addon fuctionality\"\n|cff0080ff/fcc instance|r - Toggle \"Inctance Only\"\n|cff0080ff/fcc scenario|r - Toggle \"Skip also in Scenario\"\n\n\"Hold Down\" a Modifier Key (SHIFT, ALT or CTRL)\nwill \"temporary\" disable ANY Skip!\n|r============================================================")
+    print("|cff0080ff\nfuba's Cancel Cinematic Usage:\n|r============================================================\n|cff0080ff/fcc|r or |cff0080ff/fcc help|r - Show this message\n|cff0080ff/fcc all|r - Toggle \"Addon fuctionality\"\n|cff0080ff/fcc instance|r - Toggle \"Instance Only\"\n|cff0080ff/fcc scenario|r - Toggle \"Skip also in Scenario\"\n\n\"Hold Down\" a Modifier Key (SHIFT, ALT or CTRL)\nwill \"temporary\" disable ANY Skip!\n|r============================================================")
     return
   end
   local cmd, arg = strsplit(" ", msg:trim():lower()) -- Try splitting by space
