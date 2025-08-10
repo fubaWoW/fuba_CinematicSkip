@@ -1,157 +1,287 @@
 local addonName, addon = ...
 
+-- ===== Chat & Debug =====
+local ADDON_TAG = "|cff0080ff[fuba's Cancel Cinematic]|r "
+local function AddonPrint(msg)
+  DEFAULT_CHAT_FRAME:AddMessage(ADDON_TAG .. (msg or ""))
+end
+
+local function DebugPrint(msg)
+  if fubaSkipCinematicDB and fubaSkipCinematicDB.options and fubaSkipCinematicDB.options.debug then
+    DEFAULT_CHAT_FRAME:AddMessage("|cFF0080FFfubaDebug[|r" .. tostring(msg) .. "|cFF0080FF]|r")
+  end
+end
+
+-- ===== Defaults (immutable) =====
 local DefaultDB = {
   options = {
     debug = false,
     skipAlreadySeen = true,
     skipOnlyInInstance = false,
     skipInScenario = false,
+    respectUncancellable = false,  -- NEW: honor canBeCancelled=false by default
   },
   skipThisCinematic = {},
   skipThisMovie = {},
-  neverSkipMovie = {},
+  neverSkipMovie = {}, -- Reserved for future use
   lastMovieID = 0,
-  version = 2,
+  version = 3, -- bump because of new option
 }
 
--- hopefully fixed for Classic and Wrath -- thanks to Road-block!
-local MovieFrame_StopMovie = MovieFrame_StopMovie or function(frame)
-  if MovieFrame_OnMovieFinished then
-    MovieFrame_OnMovieFinished(MovieFrame)
-  else
-    GameMovieFinished()
-    MovieFrameSubtitleString:Hide()
-    MovieFrame:StopMovie()
-    WorldFrame:Show()
-    if ( MovieFrame.uiParentShown ) then
-      UIParent:Show()
-      SetUIVisibility(true)
+-- ===== Deep copy / defaults =====
+local function CopyTableDeep(src)
+  if type(src) ~= "table" then return src end
+  local t = {}
+  for k, v in pairs(src) do
+    t[k] = CopyTableDeep(v)
+  end
+  return t
+end
+
+local function ApplyDefaults(dst, src)
+  for k, v in pairs(src) do
+    if type(v) == "table" then
+      if type(dst[k]) ~= "table" then
+        dst[k] = CopyTableDeep(v)
+      else
+        ApplyDefaults(dst[k], v)
+      end
+    elseif dst[k] == nil then
+      dst[k] = v
     end
   end
 end
 
-local function CreateDatabase()
-  if (not fubaSkipCinematicDB) or (fubaSkipCinematicDB == nil) then fubaSkipCinematicDB = DefaultDB end
-end
-
-local function ReCreateDatabase()
-  fubaSkipCinematicDB = DefaultDB
-end
-
-local function DebugPrint(debugtext)
-  if fubaSkipCinematicDB and fubaSkipCinematicDB.options.debug then
-    DEFAULT_CHAT_FRAME:AddMessage("|cFF0080FFfubaDebug\[|r"..debugtext.."|cFF0080FF\]")
+-- ===== DB init / migration =====
+local function CreateOrLoadDB()
+  if type(fubaSkipCinematicDB) ~= "table" then
+    fubaSkipCinematicDB = {}
+  end
+  ApplyDefaults(fubaSkipCinematicDB, DefaultDB)
+  if fubaSkipCinematicDB.version ~= DefaultDB.version then
+    fubaSkipCinematicDB = CopyTableDeep(DefaultDB)
+    AddonPrint("Database version mismatch detected. Database has been reset to defaults.")
   end
 end
 
-if not fubaSkipCinematicDB then
-  CreateDatabase()
-  DebugPrint("Database: Set Default Database because empty")
+-- === Key helpers ===
+-- === Key helpers ===
+local function SanitizeKeyComponent(s)
+  s = tostring(s or ""):lower()
+  s = s:gsub("%s+", " ")
+  s = s:gsub("^%s*(.-)%s*$", "%1")
+  s = s:gsub("[^%w%-%_ ]+", "")
+  s = s:gsub("%s", "_")
+  if s == "" then s = "none" end
+  return s
 end
 
-if fubaSkipCinematicDB.version and fubaSkipCinematicDB.version ~= DefaultDB.version then
-  -- do something if "Database Version" is an older version and maybe need attention?!
-  DebugPrint("\nDatabase: unsupported Database Version detected.\nDatabase will be resetted now.\This will result in some Cinematics will play again \"once\" but will work properly again after!")
-	ReCreateDatabase()
+-- Always build a 4-part key: mapID:instanceID:zone:subzone (sanitized)
+local function CinematicKey(mapID, instanceID)
+  local mapPart  = tonumber(mapID) or -1
+  local instPart = tonumber(instanceID) or 0
+
+  local zoneName    = (GetZoneText and GetZoneText()) or ""
+  local subZoneName = (GetSubZoneText and GetSubZoneText()) or ""
+
+  local zonePart    = SanitizeKeyComponent(zoneName)
+  local subZonePart = SanitizeKeyComponent(subZoneName)
+
+  return string.format("%d:%d:%s:%s", mapPart, instPart, zonePart, subZonePart)
 end
 
-MovieFrame:HookScript("OnEvent", function(self, event, ...)
-  if event == "PLAY_MOVIE" then
-    -- event PLAY_MOVIE has triggered
-    if IsModifierKeyDown() then return end -- DO NOT SKIP if any ModifierKey is pressed (ALT, CTRL or SHIFT)
+
+local function ShouldSkip()
+  if IsModifierKeyDown() then
+    DebugPrint("Modifier key held -> do not skip")
+    return false
+  end
+  local opts = fubaSkipCinematicDB.options
+  if not opts.skipAlreadySeen then
+    DebugPrint("Global skip disabled")
+    return false
+  end
+  local inInstance, instType = IsInInstance()
+  if opts.skipOnlyInInstance and not inInstance then
+    DebugPrint("Skip only in instance -> currently not in instance")
+    return false
+  end
+  if instType == "scenario" and not opts.skipInScenario then
+    DebugPrint("Scenario detected but skipInScenario is false")
+    return false
+  end
+  return true
+end
+
+
+-- ===== Safe wrappers (Blizzard-conform) =====
+-- Mirrors MovieFrame_StopMovie flow including subtitles + cinematic finished.
+local function StopGameMovieSafe()
+  local mf = MovieFrame
+  if not mf then return end
+
+  -- Stop actual playback (audio/video)
+  if type(mf.StopMovie) == "function" then
+    pcall(mf.StopMovie, mf)
+  end
+
+  -- Ensure frame hidden (MovieFrame_OnHide defensively calls StopMovie too)
+  if mf:IsShown() then
+    pcall(mf.Hide, mf)
+  end
+
+  -- Finish cinematic lifecycle for game movie
+  if type(CinematicFinished) == "function" and Enum and Enum.CinematicType then
+    pcall(CinematicFinished, Enum.CinematicType.GameMovie)
+  end
+
+  -- Stop subtitles, as Blizzard does in MovieFrame_StopMovie
+  if EventRegistry and EventRegistry.TriggerEvent then
+    pcall(EventRegistry.TriggerEvent, EventRegistry, "Subtitles.OnMovieCinematicStop")
+  end
+
+  DebugPrint("StopGameMovieSafe() executed")
+end
+
+-- Blizzard-style cancel for in-game cinematics (with fallbacks).
+local function CancelCinematicSafe()
+  if type(CinematicFrame_CancelCinematic) == "function" then
+    pcall(CinematicFrame_CancelCinematic)
+    DebugPrint("CinematicFrame_CancelCinematic() used")
+    return
+  end
+  local used = false
+  if type(StopCinematic) == "function" then
+    used = pcall(StopCinematic)
+  end
+  if not used and type(CanCancelScene) == "function" and CanCancelScene() and type(CancelScene) == "function" then
+    used = pcall(CancelScene)
+  end
+  if not used and type(CanExitVehicle) == "function" and CanExitVehicle() and type(VehicleExit) == "function" then
+    used = pcall(VehicleExit)
+  end
+  DebugPrint("Cancel fallback used")
+end
+
+-- ===== Events =====
+local evt = CreateFrame("Frame")
+evt:RegisterEvent("PLAY_MOVIE")
+evt:RegisterEvent("STOP_MOVIE")
+evt:RegisterEvent("CINEMATIC_START")
+evt:RegisterEvent("CINEMATIC_STOP")
+evt:RegisterEvent("PLAYER_LOGIN")
+
+evt:SetScript("OnEvent", function(_, event, ...)
+  if event == "PLAYER_LOGIN" then
+    CreateOrLoadDB()
+
+  elseif event == "PLAY_MOVIE" then
     local movieID = ...
-    if (not movieID) then return end
-    fubaSkipCinematicDB.lastMovieID = movieID -- save last MovieID for further actions maybe?!
-    DebugPrint("Event: PLAY_MOVIE with ID: "..movieID);
+    if not movieID then return end
+    fubaSkipCinematicDB.lastMovieID = movieID
+    DebugPrint("PLAY_MOVIE id=" .. tostring(movieID))
 
-    local skipScenario = true
-    local isInstance, instanceType = IsInInstance()
-    if instanceType == "scenario" then skipScenario = fubaSkipCinematicDB.options.skipInScenario end
-    if (not fubaSkipCinematicDB.options.skipAlreadySeen) or (fubaSkipCinematicDB.options.skipOnlyInInstance and (not isInstance)) or (not skipScenario) then return end
-
+    if not ShouldSkip() then return end
+    if fubaSkipCinematicDB.neverSkipMovie[movieID] then
+      DebugPrint("Movie [" .. tostring(movieID) .. "] in neverSkipMovie, -> do not skip")
+      return
+    end
     if fubaSkipCinematicDB.skipThisMovie[movieID] then
-      MovieFrame_StopMovie(self)
+      StopGameMovieSafe()
+      DebugPrint("Movie [" .. tostring(movieID) .. "] skipped")
     else
       fubaSkipCinematicDB.skipThisMovie[movieID] = true
+      DebugPrint("Marked movie [" .. tostring(movieID) .. "] as seen")
     end
 
   elseif event == "STOP_MOVIE" then
-  -- event STOP_MOVIE has triggered
-  end
-end)
+    DebugPrint("STOP_MOVIE")
 
-CinematicFrame:HookScript("OnEvent", function(self, event, ...)
-  if event == "CINEMATIC_START" then
-    -- event CINEMATIC_START has triggered
-    if IsModifierKeyDown() then return end -- DO NOT SKIP if any ModifierKey is pressed (ALT, CTRL or SHIFT)
-    DebugPrint("Event: CINEMATIC_START");
+  elseif event == "CINEMATIC_START" then
+    -- Payload: canBeCancelled (bool), forcedAspectRatio (enum)
+    local canBeCancelled = ...
+    DebugPrint("CINEMATIC_START canBeCancelled=" .. tostring(canBeCancelled))
 
-    local MapID = C_Map.GetBestMapForUnit("player")
-    if not MapID then return end
-    local subZoneText = GetSubZoneText() or ""
-		local Name, instanceType, difficultyID, difficultyName, maxPlayers, dynamicDifficulty, isDynamic, instanceID, instanceGroupSize, LfgDungeonID = GetInstanceInfo()
+    if not ShouldSkip() then return end
 
-    local skipScenario = true
-    local isInstance, instanceType = IsInInstance()
-    if instanceType == "scenario" then skipScenario = fubaSkipCinematicDB.options.skipInScenario end
-    if (not fubaSkipCinematicDB.options.skipAlreadySeen) or (fubaSkipCinematicDB.options.skipOnlyInInstance and (not isInstance)) or (not skipScenario) then return end
-
-    --if fubaSkipCinematicDB.skipThisCinematic[MapID..subZoneText] then
-    if fubaSkipCinematicDB.skipThisCinematic[MapID..instanceID] then
-      CinematicFrame_CancelCinematic()
-    else
-      --fubaSkipCinematicDB.skipThisCinematic[MapID..subZoneText] = true
-      fubaSkipCinematicDB.skipThisCinematic[MapID..instanceID] = true
+    -- NEW: optionally respect the flag; if respected and cannot be cancelled, do nothing.
+    local respect = (fubaSkipCinematicDB.options and fubaSkipCinematicDB.options.respectUncancellable) ~= false
+    if (canBeCancelled == false) and respect then
+      DebugPrint("Cinematic flagged non-cancellable and setting respects that -> do not skip")
+      return
     end
+
+    local mapID = C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
+    if not mapID then
+      DebugPrint("No mapID -> bail")
+      return
+    end
+	
+    local _, _, _, _, _, _, _, instanceID = GetInstanceInfo()
+	local key = CinematicKey(mapID, instanceID)
+	DebugPrint(("Key: %s"):format(key))
+	DebugPrint(("MapID: %s"):format(tostring(mapID)))
+	DebugPrint(("Instance: %s"):format(tostring(instanceID)))
+	DebugPrint(("Zone: %s"):format(tostring(GetZoneText())))
+	DebugPrint(("SubZone: %s"):format(tostring(GetSubZoneText())))
+
+	if fubaSkipCinematicDB.skipThisCinematic[key] then
+		-- Tiny deferral helps if cancel is called before frame fully shown
+		if C_Timer and C_Timer.After then
+			C_Timer.After(0.01, CancelCinematicSafe)
+		else
+			CancelCinematicSafe()
+		end
+		DebugPrint("Cinematic skipped")
+	else
+		fubaSkipCinematicDB.skipThisCinematic[key] = true
+		DebugPrint("Marked cinematic as seen")
+	end
 
   elseif event == "CINEMATIC_STOP" then
-  -- event CINEMATIC_STOP has triggered
+    DebugPrint("CINEMATIC_STOP")
   end
 end)
 
--- Slash Commands for "Config" until i maybe or not add an Optionsframe ;)
-_G.SLASH_FUBACANCELCINEMATIC1 = '/fcc'
+-- ===== Slash command =====
+_G.SLASH_FUBACANCELCINEMATIC1 = "/fcc"
 SlashCmdList.FUBACANCELCINEMATIC = function(msg)
-  if not msg or type(msg) ~= "string" or msg == "" or msg == "help" then
-    print("|cff0080ff\nfuba's Cancel Cinematic Usage:\n|r============================================================\n|cff0080ff/fcc|r or |cff0080ff/fcc help|r - Show this message\n|cff0080ff/fcc all|r - Toggle \"Addon fuctionality\"\n|cff0080ff/fcc instance|r - Toggle \"Instance Only\"\n|cff0080ff/fcc scenario|r - Toggle \"Skip also in Scenario\"\n\n\"Hold Down\" a Modifier Key (SHIFT, ALT or CTRL)\nwill \"temporary\" disable ANY Skip!\n|r============================================================")
-    return
-  end
-  local cmd, arg = strsplit(" ", msg:trim():lower()) -- Try splitting by space
+  msg = (type(msg) == "string" and msg or ""):lower():trim()
+  local cmd, arg = strsplit(" ", msg)
 
-  if cmd == "all" then
-    if fubaSkipCinematicDB.options.skipAlreadySeen then
-      fubaSkipCinematicDB.options.skipAlreadySeen = false
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Overall: |cffFF0000Disabled|r")
-    else
-      fubaSkipCinematicDB.options.skipAlreadySeen = true
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Overall: |cff00FF00Enabled|r")
-    end
+  local function ToggleOpt(flag, label)
+    local cur = fubaSkipCinematicDB.options[flag]
+    fubaSkipCinematicDB.options[flag] = not cur
+    AddonPrint(label .. (fubaSkipCinematicDB.options[flag] and "|cff00ff00Enabled|r" or "|cffff0000Disabled|r"))
+  end
+
+  if msg == "" or cmd == "help" then
+    print('|cff0080ff\nfuba\'s Cancel Cinematic Usage:\n|r============================================================\n' ..
+      '|cff0080ff/fcc|r or |cff0080ff/fcc help|r - Show this message\n' ..
+      '|cff0080ff/fcc all|r - Toggle "Addon functionality"\n' ..
+      '|cff0080ff/fcc instance|r - Toggle "Instance Only"\n' ..
+      '|cff0080ff/fcc scenario|r - Toggle "Skip also in Scenario"\n' ..
+      '|cff0080ff/fcc respect|r - Toggle "Respect non-cancellable (canBeCancelled=false)"\n' ..
+      '|cff0080ff/fcc debug|r - Toggle "Debug Messages"\n\n' ..
+      'Press & Hold any Modifier Key (SHIFT, ALT or CTRL)\n'..
+	  'will "temporarily" disable ANY Skip!\n' ..
+      '|r============================================================')
+    return
+
+  elseif cmd == "all" then
+    ToggleOpt("skipAlreadySeen", "Overall: ")
   elseif cmd == "instance" then
-    if fubaSkipCinematicDB.options.skipOnlyInInstance then
-      fubaSkipCinematicDB.options.skipOnlyInInstance = false
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Skip ONLY in Instance: |cffFF0000Disabled|r")
-    else
-      fubaSkipCinematicDB.options.skipOnlyInInstance = true
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Skip ONLY in Instance: |cff00FF00Enabled|r")
-    end
+    ToggleOpt("skipOnlyInInstance", "Skip ONLY inside an Instance: ")
   elseif cmd == "scenario" then
-    if fubaSkipCinematicDB.options.skipInScenario then
-      fubaSkipCinematicDB.options.skipInScenario = false
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Skip also in Scenario: |cffFF0000Disabled|r")
-    else
-      fubaSkipCinematicDB.options.skipInScenario = true
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Skip also in Scenario: |cff00FF00Enabled|r")
-    end
+    ToggleOpt("skipInScenario", "Skip also in Scenario: ")
+  elseif cmd == "respect" then
+    ToggleOpt("respectUncancellable", "Respect non-cancellable flag: ")
   elseif cmd == "debug" then
-    if fubaSkipCinematicDB.options.debug then
-      fubaSkipCinematicDB.options.debug = false
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Debug Messages: |cffFF0000Disabled|r")
-    else
-      fubaSkipCinematicDB.options.debug = true
-      print("|cff0080ff[fuba's Cancel Cinematic]|r Debug Messages: |cff00FF00Enabled|r")
-    end
-  elseif cmd == "developer" and arg and arg == "rdb" then
-    ReCreateDatabase()
-    print("|cff0080ff[fuba's Cancel Cinematic]|r Reseted Databse to Default")
+    ToggleOpt("debug", "Debug Messages: ")
+  elseif cmd == "dev" and arg == "reset" then
+    fubaSkipCinematicDB = CopyTableDeep(DefaultDB)
+    AddonPrint("Reset database to defaults.")
+  else
+    AddonPrint("Unknown command. Type |cff0080ff/fcc help|r.")
   end
 end
