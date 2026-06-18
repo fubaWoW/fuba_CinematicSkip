@@ -1,4 +1,4 @@
-## Interface: 110207
+## Interface: 110207, 120000
 ## Interface-Classic: 11507
 ## Interface-Wrath: 30404
 ## Interface-Cata: 40402
@@ -8,7 +8,10 @@
 ## IconTexture: Interface\AddOns\fuba_SkipCinematic\fubaLogo
 ## Notes: fuba's personal Cinematic Skipper
 ## SavedVariables: fubaSkipCinematicDB
-## X-Category: fuba
+
+## X-Category: |cffff8000fuba
+## Category-enUS: |cffff8000fuba
+## Category-deDE: |cffff8000fuba
 
 ## X-Curse-Project-ID: 721741
 
